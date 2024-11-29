@@ -1,6 +1,10 @@
 ollama==0.3.3 # Local inference
 chromadb==0.5.20 # Vector Database
-sentence-transformers==3.3.1 # CrossEncoder Re-ranking
+torch>=2.1.0 # PyTorch
+transformers>=4.36.0 # Hugging Face Transformers
+sentence-transformers==2.2.2 # CrossEncoder Re-ranking
 streamlit==1.40.1 # Application UI
 PyMuPDF==1.24.14 # PDF Document loader
 langchain-community==0.3.7 # Utils for text splitting
+openai==1.12.0 # OpenAI/DeepSeek API client
+python-dotenv==1.0.0 # Environment variable management

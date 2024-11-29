@@ -1,9 +1,10 @@
 import os
 import tempfile
-
 import chromadb
 import ollama
 import streamlit as st
+from dotenv import load_dotenv
+from openai import OpenAI
 from chromadb.utils.embedding_functions.ollama_embedding_function import (
     OllamaEmbeddingFunction,
 )
@@ -12,6 +13,10 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import CrossEncoder
 from streamlit.runtime.uploaded_file_manager import UploadedFile
+from typing import Generator
+
+# Load environment variables
+load_dotenv()
 
 system_prompt = """
 You are an AI assistant tasked with providing detailed answers based solely on the given context. Your goal is to analyze the information provided and formulate a comprehensive, well-structured response to the question.
@@ -142,7 +147,7 @@ def query_collection(prompt: str, n_results: int = 10):
     return results
 
 
-def call_llm(context: str, prompt: str):
+def call_llm(context: str, prompt: str, temperature: float, top_p: float, num_ctx: int, conversation_history: list = None):
     """Calls the language model with context and prompt to generate a response.
 
     Uses Ollama to stream responses from a language model by providing context and a
@@ -151,6 +156,10 @@ def call_llm(context: str, prompt: str):
     Args:
         context: String containing the relevant context for answering the question
         prompt: String containing the user's question
+        temperature: Controls randomness in output generation
+        top_p: Controls diversity via nucleus sampling
+        num_ctx: Maximum context length
+        conversation_history: List of previous messages in the conversation
 
     Yields:
         String chunks of the generated response as they become available from the model
@@ -158,25 +167,83 @@ def call_llm(context: str, prompt: str):
     Raises:
         OllamaError: If there are issues communicating with the Ollama API
     """
+    system_prompt = """You are a helpful AI assistant with access to both document context and conversation history. When answering questions:
+    1. Use information from both the provided context and previous conversation when relevant
+    2. If you're unsure or neither the context nor conversation history contains the answer, say so
+    3. Keep responses clear and concise
+    4. Format responses using markdown when helpful
+    5. Maintain consistency with your previous responses"""
+
+    # Initialize messages with system prompt
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    # Add conversation history if available
+    if conversation_history:
+        messages.extend(conversation_history)
+    
+    # Add current context and question
+    messages.append({
+        "role": "user",
+        "content": f"Context: {context}\nQuestion: {prompt}"
+    })
+
     response = ollama.chat(
         model="llama3.2:3b",
-        stream=True,
-        messages=[
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": f"Context: {context}, Question: {prompt}",
-            },
-        ],
+        messages=messages,
+        options={
+            "temperature": temperature,
+            "top_p": top_p,
+            "num_ctx": num_ctx,
+            "stop": ["\n\n Human:"]
+        },
+        stream=True
     )
     for chunk in response:
         if chunk["done"] is False:
             yield chunk["message"]["content"]
         else:
             break
+
+
+def call_deepseek_llm(context: str, prompt: str, temperature: float = 0.7, conversation_history: list = None) -> Generator:
+    """Calls the DeepSeek language model with context and prompt using OpenAI SDK.
+    
+    Args:
+        context: String containing the relevant context
+        prompt: String containing the user's question
+        temperature: Controls randomness in output generation
+        conversation_history: List of previous messages in the conversation
+        
+    Returns:
+        Generator yielding chunks of the model's response
+    """
+    client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com/v1")
+
+    # Initialize messages with system prompt
+    messages = [{"role": "system", "content": system_prompt}]
+
+    # Add conversation history if available
+    if conversation_history:
+        messages.extend(conversation_history)
+
+    # Add current context and prompt
+    current_prompt = f"Context:\n{context}\n\nQuestion: {prompt}"
+    messages.append({"role": "user", "content": current_prompt})
+
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=messages,
+            temperature=temperature,
+            stream=True
+        )
+
+        for chunk in response:
+            if chunk.choices[0].delta.content is not None:
+                yield chunk.choices[0].delta.content
+
+    except Exception as e:
+        yield f"Error calling DeepSeek API: {str(e)}"
 
 
 def re_rank_cross_encoders(documents: list[str]) -> tuple[str, list[int]]:
@@ -211,40 +278,145 @@ def re_rank_cross_encoders(documents: list[str]) -> tuple[str, list[int]]:
 
 
 if __name__ == "__main__":
-    # Document Upload Area
+    # Must be the first Streamlit command
+    st.set_page_config(page_title="RAG Question Answer")
+
+    # Initialize session state for conversation history and other states
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
+    
+    if 'model' not in st.session_state:
+        st.session_state.model = "deepseek"
+    
+    if 'temperature' not in st.session_state:
+        st.session_state.temperature = 0.7
+    
+    if 'top_p' not in st.session_state:
+        st.session_state.top_p = 0.7
+    
+    if 'num_ctx' not in st.session_state:
+        st.session_state.num_ctx = 4096
+
+    # Callback functions for state updates
+    def clear_chat():
+        st.session_state.messages = []
+        st.rerun()
+
+    def update_model():
+        st.session_state.model = st.session_state.model_select
+
+    # Sidebar configuration
     with st.sidebar:
-        st.set_page_config(page_title="RAG Question Answer")
-        uploaded_file = st.file_uploader(
-            "**📑 Upload PDF files for QnA**", type=["pdf"], accept_multiple_files=False
+        st.header("Model Configuration")
+        
+        # Model selection
+        st.selectbox(
+            "Select Model",
+            ["deepseek", "mistral", "llama2", "neural-chat"],
+            key="model_select",
+            on_change=update_model,
+            index=["deepseek", "mistral", "llama2", "neural-chat"].index(st.session_state.model)
         )
 
-        process = st.button(
-            "⚡️ Process",
+        # Model parameters
+        st.session_state.temperature = st.slider(
+            "Temperature",
+            min_value=0.0,
+            max_value=1.0,
+            value=st.session_state.temperature,
+            step=0.1,
+            key="temp_slider",
+            help="Controls randomness in the output. Higher values make the output more random."
         )
-        if uploaded_file and process:
-            normalize_uploaded_file_name = uploaded_file.name.translate(
-                str.maketrans({"-": "_", ".": "_", " ": "_"})
-            )
-            all_splits = process_document(uploaded_file)
-            add_to_vector_collection(all_splits, normalize_uploaded_file_name)
 
-    # Question and Answer Area
-    st.header("🗣️ RAG Question Answer")
-    prompt = st.text_area("**Ask a question related to your document:**")
-    ask = st.button(
-        "🔥 Ask",
-    )
+        st.session_state.top_p = st.slider(
+            "Top P",
+            min_value=0.0,
+            max_value=1.0,
+            value=st.session_state.top_p,
+            step=0.1,
+            key="top_p_slider",
+            help="Controls diversity via nucleus sampling"
+        )
 
-    if ask and prompt:
+        st.session_state.num_ctx = st.slider(
+            "Context Length",
+            min_value=512,
+            max_value=16384,
+            value=st.session_state.num_ctx,
+            step=512,
+            key="num_ctx_slider",
+            help="Maximum number of tokens to consider for context"
+        )
+
+        # Add clear chat button
+        st.button("Clear Chat History", on_click=clear_chat)
+
+    st.title("RAG Question Answer")
+
+    # File uploader
+    uploaded_file = st.file_uploader("Upload a PDF file", type="pdf")
+
+    if uploaded_file:
+        # Process document
+        with st.spinner("Processing document..."):
+            splits = process_document(uploaded_file)
+            add_to_vector_collection(splits, uploaded_file.name)
+            st.success("Document processed successfully!")
+
+    # Display conversation history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # Get the user question
+    if prompt := st.chat_input("Ask a question about the document"):
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Get relevant documents
         results = query_collection(prompt)
-        context = results.get("documents")[0]
-        relevant_text, relevant_text_ids = re_rank_cross_encoders(context)
-        response = call_llm(context=relevant_text, prompt=prompt)
-        st.write_stream(response)
+        documents = results["documents"][0]  # documents are already strings
 
-        with st.expander("See retrieved documents"):
-            st.write(results)
+        # Re-rank documents
+        relevant_text, relevant_text_ids = re_rank_cross_encoders(documents)
 
-        with st.expander("See most relevant document ids"):
-            st.write(relevant_text_ids)
-            st.write(relevant_text)
+        # Create the assistant message
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            full_response = ""
+
+            # Use the model selected in sidebar
+            if st.session_state.model == "deepseek":
+                response_generator = call_deepseek_llm(
+                    relevant_text, 
+                    prompt, 
+                    temperature=st.session_state.temperature,
+                    conversation_history=st.session_state.messages
+                )
+            else:
+                response_generator = call_llm(
+                    relevant_text,
+                    prompt,
+                    temperature=st.session_state.temperature,
+                    top_p=st.session_state.top_p,
+                    num_ctx=st.session_state.num_ctx,
+                    conversation_history=st.session_state.messages,
+                )
+
+            # Stream the response
+            for chunk in response_generator:
+                full_response += chunk
+                message_placeholder.markdown(full_response + "▌")
+            message_placeholder.markdown(full_response)
+        
+        # Add assistant response to chat history
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
+
+        # Display document sources
+        with st.expander("View Sources"):
+            for idx in relevant_text_ids:
+                st.markdown(f"Document chunk {idx}:")
+                st.markdown(documents[idx])
